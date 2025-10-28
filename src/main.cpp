@@ -1,4 +1,3 @@
-
 #include <iostream>
 #include <string>
 #include <vector>
@@ -8,6 +7,11 @@
 #include <map>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netinet/in.h>
 
 #include "network.hpp"
 #include "peer.hpp"
@@ -17,18 +21,18 @@ static Network *net = nullptr;
 static std::string shared_folder = ".";
 
 void print_help() {
-    std::cout << "  Usage:\n";
-    std::cout << "  p2p share <folder>        # start sharing folder (runs services)\n";
-    std::cout << "  p2p list                 # list discovered peers and files\n";
-    std::cout << "  p2p get <filename> <threads>  # download file using parallel threads\n";
+    std::cout << "Usage:\n";
+    std::cout << "  p2p share <folder>             # start sharing folder (runs services)\n";
+    std::cout << "  p2p list                       # list discovered peers and files\n";
+    std::cout << "  p2p get <filename> [threads]   # download file using parallel threads\n";
 }
 
 std::vector<std::pair<std::string,uint64_t>> gather_available_files() {
     std::vector<std::pair<std::string,uint64_t>> out;
+    if (!net) return out;
     auto peers = net->get_peers_snapshot();
     for (auto &p : peers) {
         for (auto &kv : p.files) {
-            // store as host:port|filename:size  - but keep simple
             out.emplace_back(p.addr + ":" + std::to_string(p.port) + "|" + kv.first, kv.second);
         }
     }
@@ -36,9 +40,10 @@ std::vector<std::pair<std::string,uint64_t>> gather_available_files() {
 }
 
 bool download_range(const std::string& host, int port, const std::string& filename, uint64_t start, uint64_t end, std::fstream &ofs) {
-    // connect
+    // create socket and connect
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return false;
+
     sockaddr_in srv{};
     srv.sin_family = AF_INET;
     srv.sin_port = htons(port);
@@ -46,49 +51,58 @@ bool download_range(const std::string& host, int port, const std::string& filena
 
     if (connect(sock, (sockaddr*)&srv, sizeof(srv)) < 0) { close(sock); return false; }
 
-    // send: GET filename start end\n
-    std::stringstream ss;
-    ss << "GET " << filename << " " << start << " " << end << "\n";
-    std::string req = ss.str();
-    send(sock, req.c_str(), req.size(), 0);
-
-    // read header OK <len>\n
-    char hdrbuf[64];
-    ssize_t n = recv(sock, hdrbuf, sizeof(hdrbuf)-1, 0);
-    if (n <= 0) { close(sock); return false; }
-    hdrbuf[n] = 0;
-    std::string hdr(hdrbuf);
-    if (hdr.rfind("OK ", 0) != 0) { close(sock); return false; }
-    // header may include only part of payload; find newline
-    auto pos = hdr.find('\n');
-    std::string firstline = hdr.substr(0, pos);
-    // parse len
-    auto sp = split(firstline, ' ');
-    uint64_t expected = std::stoull(sp[1]);
-
-    // the rest of hdr after newline is the beginning of data (if pos != n)
-    size_t data_start = (pos == std::string::npos) ? n : (pos + 1);
-    size_t already = (data_start < (size_t)n) ? (n - data_start) : 0;
-    if (already > 0) {
-        // write at offset start
-        ofs.seekp(start);
-        ofs.write(hdrbuf + data_start, already);
+    // send request: GET filename start end\n
+    {
+        std::stringstream ss;
+        ss << "GET " << filename << " " << start << " " << end << "\n";
+        std::string req = ss.str();
+        ssize_t s = send(sock, req.c_str(), (size_t)req.size(), 0);
+        if (s != (ssize_t)req.size()) { close(sock); return false; }
     }
 
-    uint64_t received = already;
-    const size_t bufsize = 64*1024;
+    // Read header line "OK <len>\n" robustly (header is ASCII terminated by '\n')
+    std::string header;
+    char ch;
+    while (true) {
+        ssize_t r = recv(sock, &ch, 1, 0);
+        if (r <= 0) { close(sock); return false; }
+        header.push_back(ch);
+        if (ch == '\n') break;
+        // safety: avoid overly long header
+        if (header.size() > 1024) { close(sock); return false; }
+    }
+
+    if (header.rfind("OK ", 0) != 0) {
+        close(sock);
+        return false;
+    }
+    auto hparts = split(header, ' ');
+    if (hparts.size() < 2) { close(sock); return false; }
+    uint64_t expected = 0;
+    try {
+        expected = std::stoull(hparts[1]);
+    } catch(...) { close(sock); return false; }
+
+    // Now stream expected bytes from the socket into the file at offset `start`.
+    const size_t bufsize = 64 * 1024;
     std::vector<char> buffer(bufsize);
+    uint64_t received = 0;
+
+    // If there is any extra data already in the socket's receive buffer after the '\n'
+    // we already consumed exactly up to '\n' and no extra data is in 'header' (we read byte-by-byte).
+    // So continue receiving the rest.
     while (received < expected) {
-        ssize_t r = recv(sock, buffer.data(), bufsize, 0);
+        ssize_t r = recv(sock, buffer.data(), (size_t)std::min<uint64_t>(bufsize, expected - received), 0);
         if (r <= 0) break;
-        ofs.seekp(start + received);
+        ofs.seekp((std::streampos)(start + received));
         ofs.write(buffer.data(), r);
-        received += r;
+        if (!ofs) break;
+        received += (uint64_t)r;
     }
+
     close(sock);
     return received == expected;
 }
-
 
 int main(int argc, char** argv) {
     if (argc < 2) { print_help(); return 1; }
@@ -111,11 +125,8 @@ int main(int argc, char** argv) {
         std::cout << "Services started. Press Ctrl+C to stop.\n";
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(10));
-            // optionally show known peers
-            // auto peers = net->get_peers_snapshot();
         }
     } else if (cmd == "list") {
-        //  start listen only to populate peers for a short time
         net->start_listen_peers();
         std::cout << "Listening for peers for 4 seconds...\n";
         std::this_thread::sleep_for(std::chrono::seconds(4));
@@ -136,7 +147,6 @@ int main(int argc, char** argv) {
         if (argc >= 4) threads = std::max(1, atoi(argv[3]));
         std::string filename = argv[2];
 
-        // find a peer that has this file
         net->start_listen_peers();
         std::this_thread::sleep_for(std::chrono::seconds(3));
         auto peers = net->get_peers_snapshot();
@@ -151,20 +161,27 @@ int main(int argc, char** argv) {
         if (host.empty()) { std::cout << "No peer has that file.\n"; return 1; }
         std::cout << "Found on " << host << ":" << port << " size=" << size << " bytes\n";
 
-        // prepare destination file
-        std::fstream ofs(filename, std::ios::binary | std::ios::out | std::ios::trunc);
-        ofs.seekp(size-1);
-        ofs.write("",1);
-        ofs.flush();
+        // prepare destination file (pre-allocate)
+        {
+            std::fstream ofs(filename, std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!ofs) { std::cout << "Failed to create output file\n"; return 1; }
+            if (size > 0) {
+                // write a single zero byte at position size-1 to allocate file
+                ofs.seekp((std::streampos)(size - 1));
+                char zero = 0;
+                ofs.write(&zero, 1);
+            }
+            ofs.close();
+        }
 
         // compute ranges
-        uint64_t chunk = size / threads;
+        uint64_t chunk = (size + threads - 1) / threads; // ceil division
         std::vector<std::pair<uint64_t,uint64_t>> ranges;
         uint64_t cur = 0;
-        for (int i=0;i<threads;++i) {
+        for (int i = 0; i < threads; ++i) {
             uint64_t start = cur;
-            uint64_t end = (i == threads-1) ? size : (cur + chunk);
-            ranges.emplace_back(start, end);
+            uint64_t end = std::min<uint64_t>(size, cur + chunk);
+            if (start >= end) { ranges.emplace_back(0,0); } else ranges.emplace_back(start, end);
             cur = end;
         }
 
@@ -172,9 +189,10 @@ int main(int argc, char** argv) {
         std::vector<bool> success(threads,false);
         for (int i=0;i<threads;++i) {
             ths.emplace_back([&,i](){
+                auto [s,e] = ranges[i];
+                if (s >= e) { success[i] = true; return; } // nothing to do for this thread
                 std::fstream localfs(filename, std::ios::in | std::ios::out | std::ios::binary);
                 if (!localfs) { success[i]=false; return; }
-                auto [s,e] = ranges[i];
                 bool ok = download_range(host, port, filename, s, e, localfs);
                 success[i] = ok;
                 std::cout << "Thread " << i << " finished " << (ok?"OK":"FAIL") << "\n";

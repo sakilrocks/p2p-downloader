@@ -2,12 +2,20 @@
 #ifndef UTILS_HPP
 #define UTILS_HPP
 
-#include <string>
 #include <vector>
-#include <cstdint>
+#include <string>
+#include <sstream>
 
-std::vector<std::string> split(const std::string& s, char delim);
-std::string join(const std::vector<std::string>& parts, char delim);
+inline std::vector<std::string> split(const std::string &s, char delim) {
+    std::vector<std::string> elems;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        if (!item.empty())
+            elems.push_back(item);
+    }
+    return elems;
+}
 
 
-#endif
+#endif 
