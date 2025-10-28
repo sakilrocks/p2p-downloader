@@ -16,12 +16,17 @@
 
 namespace fs = std::filesystem;
 
+static constexpr int DISCOVERY_PORT = 10000; // UDP discovery port
+
 Network::Network(int service_port) : service_port_(service_port) {}
 Network::~Network() {
     running_ = false;
-    if (broadcast_thread_.joinable()) broadcast_thread_.join();
-    if (listener_thread_.joinable()) listener_thread_.join();
-    if (tcp_server_thread_.joinable()) tcp_server_thread_.join();
+    // join threads if running
+    try {
+        if (broadcast_thread_.joinable()) broadcast_thread_.join();
+        if (listener_thread_.joinable()) listener_thread_.join();
+        if (tcp_server_thread_.joinable()) tcp_server_thread_.join();
+    } catch (...) {}
 }
 
 
@@ -59,24 +64,35 @@ void Network::broadcast_worker(const std::string& shared_folder) {
     }
 
     int broadcastEnable = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable));
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0) {
+        std::cerr << "[broadcast] setsockopt SO_BROADCAST failed\n";
+        // continue; it's not always fatal
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(service_port_);
+    addr.sin_port = htons(DISCOVERY_PORT);
     addr.sin_addr.s_addr = inet_addr("255.255.255.255");
 
     while (running_) {
         std::stringstream ss;
+        // Format: "PEER <tcp_port> filename1:size1,filename2:size2,"
         ss << "PEER " << service_port_ << " ";
-        for (auto &entry : fs::directory_iterator(shared_folder)) {
-            if (entry.is_regular_file()) {
-                ss << entry.path().filename().string() << ":" << fs::file_size(entry) << ",";
+        bool first = true;
+        try {
+            for (auto &entry : fs::directory_iterator(shared_folder)) {
+                if (!entry.is_regular_file()) continue;
+                if (!first) ss << ",";
+                first = false;
+                ss << entry.path().filename().string() << ":" << fs::file_size(entry.path());
             }
+        } catch (const std::exception &e) {
+            // ignore errors reading folder
         }
 
         std::string msg = ss.str();
-        sendto(sock, msg.c_str(), msg.size(), 0, (sockaddr*)&addr, sizeof(addr));
+        ssize_t sent = sendto(sock, msg.c_str(), msg.size(), 0, (sockaddr*)&addr, sizeof(addr));
+        (void)sent;
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     close(sock);
@@ -86,6 +102,12 @@ void Network::broadcast_worker(const std::string& shared_folder) {
 // ---------------------------------------------------------------
 // Listen for peers (UDP)
 // ---------------------------------------------------------------
+static inline std::string ltrim(const std::string &s) {
+    size_t i = 0;
+    while (i < s.size() && isspace((unsigned char)s[i])) ++i;
+    return s.substr(i);
+}
+
 void Network::listener_worker() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
@@ -96,7 +118,7 @@ void Network::listener_worker() {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(service_port_);
+    addr.sin_port = htons(DISCOVERY_PORT);
 
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::cerr << "[listener] bind failed\n";
@@ -104,7 +126,7 @@ void Network::listener_worker() {
         return;
     }
 
-    char buf[4096];
+    char buf[8192];
     while (running_) {
         sockaddr_in src{};
         socklen_t len = sizeof(src);
@@ -113,29 +135,41 @@ void Network::listener_worker() {
         buf[n] = '\0';
 
         std::string msg(buf);
-        if (!msg.starts_with("PEER ")) continue;
+        // ensure it starts with "PEER "
+        if (msg.size() < 5) continue;
+        if (msg.compare(0, 5, "PEER ") != 0) continue;
 
         std::istringstream iss(msg);
         std::string tag;
-        int port;
-        iss >> tag >> port;
+        int peer_tcp_port = 0;
+        if (!(iss >> tag >> peer_tcp_port)) continue;
 
         std::string rest;
         std::getline(iss, rest);
+        rest = ltrim(rest); // removes leading spaces
+
         std::string ip = inet_ntoa(src.sin_addr);
 
         PeerInfo peer;
         peer.addr = ip;
-        peer.port = port;
+        peer.port = peer_tcp_port;
 
-        // parse files: "name:size,name2:size2,"
-        auto parts = split(rest, ',');
-        for (auto &p : parts) {
-            auto kv = split(p, ':');
-            if (kv.size() == 2) {
+        // parse files: "name:size,name2:size2,..." (maybe trailing comma)
+        if (!rest.empty()) {
+            // split by comma
+            auto items = split(rest, ',');
+            for (auto &item : items) {
+                if (item.empty()) continue;
+                auto kv = split(item, ':');
+                if (kv.size() != 2) continue;
+                std::string fname = kv[0];
+                std::string ssize = kv[1];
                 try {
-                    peer.files[kv[0]] = std::stoull(kv[1]);
-                } catch (...) {}
+                    uint64_t fsize = std::stoull(ssize);
+                    peer.files[fname] = fsize;
+                } catch (...) {
+                    // ignore bad size parse
+                }
             }
         }
 
@@ -167,7 +201,9 @@ void Network::tcp_server_worker(const std::string& shared_folder) {
     }
 
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        // not fatal
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -180,7 +216,7 @@ void Network::tcp_server_worker(const std::string& shared_folder) {
         return;
     }
 
-    if (listen(server_fd, 5) < 0) {
+    if (listen(server_fd, 10) < 0) {
         std::cerr << "[tcp_server] listen failed\n";
         close(server_fd);
         return;
@@ -192,58 +228,80 @@ void Network::tcp_server_worker(const std::string& shared_folder) {
         sockaddr_in client{};
         socklen_t len = sizeof(client);
         int cfd = accept(server_fd, (sockaddr*)&client, &len);
-        if (cfd < 0) continue;
+        if (cfd < 0) {
+            // accept can be interrupted by signals; continue
+            continue;
+        }
 
+        // handle each client in detached thread
         std::thread([cfd, shared_folder]() {
-            char buf[1024];
-            ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
-            if (n <= 0) { close(cfd); return; }
-            buf[n] = '\0';
-            std::string req(buf);
-
-            if (!req.starts_with("GET ")) {
-                close(cfd);
-                return;
+            // Read a full line request (ends with '\n')
+            std::string req;
+            char ch;
+            ssize_t r;
+            // read until newline or buffer full
+            while (true) {
+                r = recv(cfd, &ch, 1, 0);
+                if (r <= 0) { close(cfd); return; }
+                req.push_back(ch);
+                if (ch == '\n') break;
+                if (req.size() > 4096) { close(cfd); return; }
             }
 
-            auto parts = split(req, ' ');
-            if (parts.size() < 4) { close(cfd); return; }
-            std::string filename = parts[1];
-            uint64_t start = std::stoull(parts[2]);
-            uint64_t end = std::stoull(parts[3]);
+            // tokenize by whitespace robustly
+            std::istringstream iss(req);
+            std::string cmd;
+            if (!(iss >> cmd)) { close(cfd); return; }
+            if (cmd != "GET") { close(cfd); return; }
+
+            std::string filename;
+            uint64_t start = 0, end = 0;
+            if (!(iss >> filename >> start >> end)) {
+                // If client didn't send start/end, treat as entire file request
+                // Reset stream and try parsing filename only
+                iss.clear();
+                iss.str(req);
+                // re-extract
+                iss >> cmd >> filename;
+                // leave start=0; end=0 means send full file
+            }
 
             std::string path = shared_folder + "/" + filename;
             if (!fs::exists(path)) {
                 std::string err = "ERR nofile\n";
-                send(cfd, err.c_str(), err.size(), 0);
+                send(cfd, err.c_str(), (size_t)err.size(), 0);
                 close(cfd);
                 return;
             }
 
-            uint64_t size = fs::file_size(path);
-            if (end > size) end = size;
+            uint64_t fsize = 0;
+            try { fsize = fs::file_size(path); } catch(...) { fsize = 0; }
+
+            if (end == 0 || end > fsize) end = fsize;
             if (start >= end) { close(cfd); return; }
 
-            uint64_t len_to_send = end - start;
+            uint64_t tosend = end - start;
             std::ifstream ifs(path, std::ios::binary);
             if (!ifs) { close(cfd); return; }
             ifs.seekg((std::streampos)start);
 
-            std::stringstream header;
-            header << "OK " << len_to_send << "\n";
-            std::string hdr = header.str();
-            send(cfd, hdr.c_str(), hdr.size(), 0);
+            // send header
+            std::ostringstream hdr;
+            hdr << "OK " << tosend << "\n";
+            std::string hdrs = hdr.str();
+            send(cfd, hdrs.c_str(), hdrs.size(), 0);
 
             const size_t bufsize = 64 * 1024;
             std::vector<char> buffer(bufsize);
             uint64_t sent = 0;
-            while (sent < len_to_send && ifs) {
-                size_t toread = std::min<uint64_t>(bufsize, len_to_send - sent);
-                ifs.read(buffer.data(), toread);
-                size_t got = ifs.gcount();
+            while (sent < tosend && ifs) {
+                size_t want = (size_t)std::min<uint64_t>(bufsize, tosend - sent);
+                ifs.read(buffer.data(), want);
+                size_t got = (size_t)ifs.gcount();
                 if (got == 0) break;
-                send(cfd, buffer.data(), got, 0);
-                sent += got;
+                ssize_t s = send(cfd, buffer.data(), got, 0);
+                if (s <= 0) break;
+                sent += (uint64_t)s;
             }
             close(cfd);
         }).detach();
