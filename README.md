@@ -20,6 +20,7 @@ each peer broadcasts its shared files on the network, discovers other peers auto
 ## Project Structure
 
 ```
+p2p-downloader
 ├── include/
 │   ├── network.hpp      # peer discovery + TCP server
 │   ├── downloader.hpp   # handles threaded downloads
